@@ -118,7 +118,7 @@ func NewCmdRepos(f *cmdutil.Factory, runF func(*ReposOptions) error) *cobra.Comm
 	cmd.Flags().StringVar(&opts.Query.Qualifiers.Stars, "stars", "", "Filter on `number` of stars")
 	cmd.Flags().StringSliceVar(&opts.Query.Qualifiers.Topic, "topic", nil, "Filter on topic")
 	cmd.Flags().StringVar(&opts.Query.Qualifiers.Topics, "number-topics", "", "Filter on `number` of topics")
-	cmd.Flags().StringVar(&opts.Query.Qualifiers.User, "owner", "", "Filter on owner")
+	cmd.Flags().StringSliceVar(&opts.Query.Qualifiers.User, "owner", nil, "Filter on owner")
 
 	return cmd
 }
@@ -158,8 +158,7 @@ func displayResults(io *iostreams.IOStreams, now time.Time, results search.Repos
 		now = time.Now()
 	}
 	cs := io.ColorScheme()
-	tp := tableprinter.New(io)
-	tp.HeaderRow("Name", "Description", "Visibility", "Updated")
+	tp := tableprinter.New(io, tableprinter.WithHeader("Name", "Description", "Visibility", "Updated"))
 	for _, repo := range results.Items {
 		tags := []string{visibilityLabel(repo)}
 		if repo.IsFork {

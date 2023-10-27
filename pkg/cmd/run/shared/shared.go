@@ -4,19 +4,21 @@ import (
 	"archive/zip"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"reflect"
 	"strings"
 	"time"
 
-	"github.com/AlecAivazis/survey/v2"
 	"github.com/cli/cli/v2/api"
 	"github.com/cli/cli/v2/internal/ghrepo"
-	"github.com/cli/cli/v2/internal/prompter"
 	workflowShared "github.com/cli/cli/v2/pkg/cmd/workflow/shared"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	"github.com/cli/cli/v2/pkg/prompt"
 )
+
+type Prompter interface {
+	Select(string, string, []string) (int, error)
+}
 
 const (
 	// Run statuses
@@ -303,6 +305,8 @@ type FilterOptions struct {
 	// avoid loading workflow name separately and use the provided one
 	WorkflowName string
 	Status       string
+	Event        string
+	Created      string
 }
 
 // GetRunsWithFilter fetches 50 runs from the API and filters them in-memory
@@ -347,6 +351,12 @@ func GetRuns(client *api.Client, repo ghrepo.Interface, opts *FilterOptions, lim
 		}
 		if opts.Status != "" {
 			path += fmt.Sprintf("&status=%s", url.QueryEscape(opts.Status))
+		}
+		if opts.Event != "" {
+			path += fmt.Sprintf("&event=%s", url.QueryEscape(opts.Event))
+		}
+		if opts.Created != "" {
+			path += fmt.Sprintf("&created=%s", url.QueryEscape(opts.Created))
 		}
 	}
 
@@ -415,19 +425,35 @@ func preloadWorkflowNames(client *api.Client, repo ghrepo.Interface, runs []Run)
 }
 
 type JobsPayload struct {
-	Jobs []Job
+	TotalCount int `json:"total_count"`
+	Jobs       []Job
 }
 
-func GetJobs(client *api.Client, repo ghrepo.Interface, run *Run) ([]Job, error) {
+func GetJobs(client *api.Client, repo ghrepo.Interface, run *Run, attempt uint64) ([]Job, error) {
 	if run.Jobs != nil {
 		return run.Jobs, nil
 	}
-	var result JobsPayload
-	if err := client.REST(repo.RepoHost(), "GET", run.JobsURL, nil, &result); err != nil {
-		return nil, err
+
+	query := url.Values{}
+	query.Set("per_page", "100")
+	jobsPath := fmt.Sprintf("%s?%s", run.JobsURL, query.Encode())
+
+	if attempt > 0 {
+		jobsPath = fmt.Sprintf("repos/%s/actions/runs/%d/attempts/%d/jobs?%s", ghrepo.FullName(repo), run.ID, attempt, query.Encode())
 	}
-	run.Jobs = result.Jobs
-	return result.Jobs, nil
+
+	for jobsPath != "" {
+		var resp JobsPayload
+		var err error
+		jobsPath, err = client.RESTWithNext(repo.RepoHost(), http.MethodGet, jobsPath, nil, &resp)
+		if err != nil {
+			run.Jobs = nil
+			return nil, err
+		}
+
+		run.Jobs = append(run.Jobs, resp.Jobs...)
+	}
+	return run.Jobs, nil
 }
 
 func GetJob(client *api.Client, repo ghrepo.Interface, jobID string) (*Job, error) {
@@ -443,7 +469,7 @@ func GetJob(client *api.Client, repo ghrepo.Interface, jobID string) (*Job, erro
 }
 
 // SelectRun prompts the user to select a run from a list of runs by using the recommended prompter interface
-func SelectRun(p prompter.Prompter, cs *iostreams.ColorScheme, runs []Run) (string, error) {
+func SelectRun(p Prompter, cs *iostreams.ColorScheme, runs []Run) (string, error) {
 	now := time.Now()
 
 	candidates := []string{}
@@ -456,36 +482,6 @@ func SelectRun(p prompter.Prompter, cs *iostreams.ColorScheme, runs []Run) (stri
 	}
 
 	selected, err := p.Select("Select a workflow run", "", candidates)
-
-	if err != nil {
-		return "", err
-	}
-
-	return fmt.Sprintf("%d", runs[selected].ID), nil
-}
-
-// TODO: this should be deprecated in favor of SelectRun
-func PromptForRun(cs *iostreams.ColorScheme, runs []Run) (string, error) {
-	var selected int
-	now := time.Now()
-
-	candidates := []string{}
-
-	for _, run := range runs {
-		symbol, _ := Symbol(cs, run.Status, run.Conclusion)
-		candidates = append(candidates,
-			// TODO truncate commit message, long ones look terrible
-			fmt.Sprintf("%s %s, %s (%s) %s", symbol, run.Title(), run.WorkflowName(), run.HeadBranch, preciseAgo(now, run.StartedTime())))
-	}
-
-	// TODO consider custom filter so it's fuzzier. right now matches start anywhere in string but
-	// become contiguous
-	//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-	err := prompt.SurveyAskOne(&survey.Select{
-		Message:  "Select a workflow run",
-		Options:  candidates,
-		PageSize: 10,
-	}, &selected)
 
 	if err != nil {
 		return "", err

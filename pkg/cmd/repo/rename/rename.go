@@ -124,8 +124,6 @@ func renameRun(opts *RenameOptions) error {
 		return err
 	}
 
-	renamedRepo := ghrepo.New(newRepo.Owner.Login, newRepo.Name)
-
 	cs := opts.IO.ColorScheme()
 	if opts.IO.IsStdoutTTY() {
 		fmt.Fprintf(opts.IO.Out, "%s Renamed repository %s\n", cs.SuccessIcon(), ghrepo.FullName(newRepo))
@@ -135,7 +133,7 @@ func renameRun(opts *RenameOptions) error {
 		return nil
 	}
 
-	remote, err := updateRemote(currRepo, renamedRepo, opts)
+	remote, err := updateRemote(currRepo, newRepo, opts)
 	if err != nil {
 		fmt.Fprintf(opts.IO.ErrOut, "%s Warning: unable to update remote %q: %v\n", cs.WarningIcon(), remote.Name, err)
 	} else if opts.IO.IsStdoutTTY() {
@@ -151,10 +149,7 @@ func updateRemote(repo ghrepo.Interface, renamed ghrepo.Interface, opts *RenameO
 		return nil, err
 	}
 
-	protocol, err := cfg.GetOrDefault(repo.RepoHost(), "git_protocol")
-	if err != nil {
-		return nil, err
-	}
+	protocol := cfg.Authentication().GitProtocol(repo.RepoHost())
 
 	remotes, err := opts.Remotes()
 	if err != nil {

@@ -4,9 +4,9 @@ import (
 	"os"
 	"path/filepath"
 
-	ghAuth "github.com/cli/go-gh/pkg/auth"
-	ghConfig "github.com/cli/go-gh/pkg/config"
-	"github.com/zalando/go-keyring"
+	"github.com/cli/cli/v2/internal/keyring"
+	ghAuth "github.com/cli/go-gh/v2/pkg/auth"
+	ghConfig "github.com/cli/go-gh/v2/pkg/config"
 )
 
 const (
@@ -29,7 +29,7 @@ type Config interface {
 }
 
 func NewConfig() (Config, error) {
-	c, err := ghConfig.Read()
+	c, err := ghConfig.Read(fallbackConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -53,22 +53,13 @@ func (c *cfg) Get(hostname, key string) (string, error) {
 }
 
 func (c *cfg) GetOrDefault(hostname, key string) (string, error) {
-	var val string
-	var err error
-	if hostname != "" {
-		val, err = c.cfg.Get([]string{hosts, hostname, key})
-		if err == nil {
-			return val, err
-		}
-	}
-
-	val, err = c.cfg.Get([]string{key})
+	val, err := c.Get(hostname, key)
 	if err == nil {
 		return val, err
 	}
 
-	if defaultExists(key) {
-		return defaultFor(key), nil
+	if val, ok := defaultFor(key); ok {
+		return val, nil
 	}
 
 	return val, err
@@ -94,22 +85,13 @@ func (c *cfg) Authentication() *AuthConfig {
 	return &AuthConfig{cfg: c.cfg}
 }
 
-func defaultFor(key string) string {
-	for _, co := range configOptions {
+func defaultFor(key string) (string, bool) {
+	for _, co := range ConfigOptions() {
 		if co.Key == key {
-			return co.DefaultValue
+			return co.DefaultValue, true
 		}
 	}
-	return ""
-}
-
-func defaultExists(key string) bool {
-	for _, co := range configOptions {
-		if co.Key == key {
-			return true
-		}
-	}
-	return false
+	return "", false
 }
 
 // AuthConfig is used for interacting with some persistent configuration for gh,
@@ -124,7 +106,7 @@ type AuthConfig struct {
 
 // Token will retrieve the auth token for the given hostname,
 // searching environment variables, plain text config, and
-// lastly encypted storage.
+// lastly encrypted storage.
 func (c *AuthConfig) Token(hostname string) (string, string) {
 	if c.tokenOverride != nil {
 		return c.tokenOverride(hostname)
@@ -153,6 +135,10 @@ func (c *AuthConfig) HasEnvToken() bool {
 			return true
 		}
 	}
+	// TODO: This is _extremely_ knowledgable about the implementation of TokenFromEnvOrConfig
+	// It has to use a hostname that is not going to be found in the hosts so that it
+	// can guarantee that tokens will only be returned from a set env var.
+	// Discussed here, but maybe worth revisiting: https://github.com/cli/cli/pull/7169#discussion_r1136979033
 	token, _ := ghAuth.TokenFromEnvOrConfig(hostname)
 	return token != ""
 }
@@ -178,13 +164,20 @@ func (c *AuthConfig) User(hostname string) (string, error) {
 
 // GitProtocol will retrieve the git protocol for the logged in user at the given hostname.
 // If none is set it will return the default value.
-func (c *AuthConfig) GitProtocol(hostname string) (string, error) {
+func (c *AuthConfig) GitProtocol(hostname string) string {
 	key := "git_protocol"
-	val, err := c.cfg.Get([]string{hosts, hostname, key})
-	if err == nil {
-		return val, err
+	if val, err := c.cfg.Get([]string{hosts, hostname, key}); err == nil {
+		return val
 	}
-	return defaultFor(key), nil
+
+	if val, ok := defaultFor(key); ok {
+		return val
+	}
+
+	// This should not happen, as we know there is a default value for this key.
+	// Perhaps it says something about our current default abstraction being not quite right?
+	// The defaults are also currently used to provide information about the config options.
+	return ""
 }
 
 func (c *AuthConfig) Hosts() []string {
@@ -220,7 +213,7 @@ func (c *AuthConfig) SetDefaultHost(host, source string) {
 // Login will set user, git protocol, and auth token for the given hostname.
 // If the encrypt option is specified it will first try to store the auth token
 // in encrypted storage and will fall back to the plain text config file.
-func (c *AuthConfig) Login(hostname, username, token, gitProtocol string, secureStorage bool) error {
+func (c *AuthConfig) Login(hostname, username, token, gitProtocol string, secureStorage bool) (bool, error) {
 	var setErr error
 	if secureStorage {
 		if setErr = keyring.Set(keyringServiceName(hostname), "", token); setErr == nil {
@@ -228,24 +221,23 @@ func (c *AuthConfig) Login(hostname, username, token, gitProtocol string, secure
 			_ = c.cfg.Remove([]string{hosts, hostname, oauthToken})
 		}
 	}
+	insecureStorageUsed := false
 	if !secureStorage || setErr != nil {
 		c.cfg.Set([]string{hosts, hostname, oauthToken}, token)
+		insecureStorageUsed = true
 	}
-	if username != "" {
-		c.cfg.Set([]string{hosts, hostname, "user"}, username)
-	}
+
+	c.cfg.Set([]string{hosts, hostname, "user"}, username)
+
 	if gitProtocol != "" {
 		c.cfg.Set([]string{hosts, hostname, "git_protocol"}, gitProtocol)
 	}
-	return ghConfig.Write(c.cfg)
+	return insecureStorageUsed, ghConfig.Write(c.cfg)
 }
 
 // Logout will remove user, git protocol, and auth token for the given hostname.
 // It will remove the auth token from the encrypted storage if it exists there.
 func (c *AuthConfig) Logout(hostname string) error {
-	if hostname == "" {
-		return nil
-	}
 	_ = c.cfg.Remove([]string{hosts, hostname})
 	_ = keyring.Delete(keyringServiceName(hostname), "")
 	return ghConfig.Write(c.cfg)
@@ -284,6 +276,28 @@ func (a *AliasConfig) All() map[string]string {
 	return out
 }
 
+func fallbackConfig() *ghConfig.Config {
+	return ghConfig.ReadFromString(defaultConfigStr)
+}
+
+const defaultConfigStr = `
+# What protocol to use when performing git operations. Supported values: ssh, https
+git_protocol: https
+# What editor gh should run when creating issues, pull requests, etc. If blank, will refer to environment.
+editor:
+# When to interactively prompt. This is a global config that cannot be overridden by hostname. Supported values: enabled, disabled
+prompt: enabled
+# A pager program to send command output to, e.g. "less". Set the value to "cat" to disable the pager.
+pager:
+# Aliases allow you to create nicknames for gh commands
+aliases:
+  co: pr checkout
+# The path to a unix socket through which send HTTP connections. If blank, HTTP traffic will be handled by net/http.DefaultTransport.
+http_unix_socket:
+# What web browser gh should use when opening URLs. If blank, will refer to environment.
+browser:
+`
+
 type ConfigOption struct {
 	Key           string
 	Description   string
@@ -291,43 +305,41 @@ type ConfigOption struct {
 	AllowedValues []string
 }
 
-var configOptions = []ConfigOption{
-	{
-		Key:           "git_protocol",
-		Description:   "the protocol to use for git clone and push operations",
-		DefaultValue:  "https",
-		AllowedValues: []string{"https", "ssh"},
-	},
-	{
-		Key:          "editor",
-		Description:  "the text editor program to use for authoring text",
-		DefaultValue: "",
-	},
-	{
-		Key:           "prompt",
-		Description:   "toggle interactive prompting in the terminal",
-		DefaultValue:  "enabled",
-		AllowedValues: []string{"enabled", "disabled"},
-	},
-	{
-		Key:          "pager",
-		Description:  "the terminal pager program to send standard output to",
-		DefaultValue: "",
-	},
-	{
-		Key:          "http_unix_socket",
-		Description:  "the path to a Unix socket through which to make an HTTP connection",
-		DefaultValue: "",
-	},
-	{
-		Key:          "browser",
-		Description:  "the web browser to use for opening URLs",
-		DefaultValue: "",
-	},
-}
-
 func ConfigOptions() []ConfigOption {
-	return configOptions
+	return []ConfigOption{
+		{
+			Key:           "git_protocol",
+			Description:   "the protocol to use for git clone and push operations",
+			DefaultValue:  "https",
+			AllowedValues: []string{"https", "ssh"},
+		},
+		{
+			Key:          "editor",
+			Description:  "the text editor program to use for authoring text",
+			DefaultValue: "",
+		},
+		{
+			Key:           "prompt",
+			Description:   "toggle interactive prompting in the terminal",
+			DefaultValue:  "enabled",
+			AllowedValues: []string{"enabled", "disabled"},
+		},
+		{
+			Key:          "pager",
+			Description:  "the terminal pager program to send standard output to",
+			DefaultValue: "",
+		},
+		{
+			Key:          "http_unix_socket",
+			Description:  "the path to a Unix socket through which to make an HTTP connection",
+			DefaultValue: "",
+		},
+		{
+			Key:          "browser",
+			Description:  "the web browser to use for opening URLs",
+			DefaultValue: "",
+		},
+	}
 }
 
 func HomeDirPath(subdir string) (string, error) {

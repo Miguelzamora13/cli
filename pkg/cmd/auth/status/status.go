@@ -66,7 +66,7 @@ func statusRun(opts *StatusOptions) error {
 	// TODO check tty
 
 	stderr := opts.IO.ErrOut
-
+	stdout := opts.IO.Out
 	cs := opts.IO.ColorScheme()
 
 	statusInfo := map[string][]string{}
@@ -108,7 +108,7 @@ func statusRun(opts *StatusOptions) error {
 		scopesHeader, err := shared.GetScopes(httpClient, hostname, token)
 		if err != nil {
 			addMsg("%s %s: authentication failed", cs.Red("X"), hostname)
-			addMsg("- The %s token in %s is no longer valid.", cs.Bold(hostname), tokenSource)
+			addMsg("- The %s token in %s is invalid.", cs.Bold(hostname), tokenSource)
 			if tokenIsWriteable {
 				addMsg("- To re-authenticate, run: %s %s",
 					cs.Bold("gh auth login -h"), cs.Bold(hostname))
@@ -139,7 +139,7 @@ func statusRun(opts *StatusOptions) error {
 			}
 
 			addMsg("%s Logged in to %s as %s (%s)", cs.SuccessIcon(), hostname, cs.Bold(username), tokenSource)
-			proto, _ := authCfg.GitProtocol(hostname)
+			proto := authCfg.GitProtocol(hostname)
 			if proto != "" {
 				addMsg("%s Git operations for %s configured to use %s protocol.",
 					cs.SuccessIcon(), hostname, cs.Bold(proto))
@@ -166,13 +166,22 @@ func statusRun(opts *StatusOptions) error {
 		if !ok {
 			continue
 		}
-		if prevEntry {
+		if prevEntry && failed {
 			fmt.Fprint(stderr, "\n")
+		} else if prevEntry && !failed {
+			fmt.Fprint(stdout, "\n")
 		}
 		prevEntry = true
-		fmt.Fprintf(stderr, "%s\n", cs.Bold(hostname))
-		for _, line := range lines {
-			fmt.Fprintf(stderr, "  %s\n", line)
+		if failed {
+			fmt.Fprintf(stderr, "%s\n", cs.Bold(hostname))
+			for _, line := range lines {
+				fmt.Fprintf(stderr, "  %s\n", line)
+			}
+		} else {
+			fmt.Fprintf(stdout, "%s\n", cs.Bold(hostname))
+			for _, line := range lines {
+				fmt.Fprintf(stdout, "  %s\n", line)
+			}
 		}
 	}
 

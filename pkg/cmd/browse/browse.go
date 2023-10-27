@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -36,13 +37,14 @@ type BrowseOptions struct {
 
 	SelectorArg string
 
-	Branch        string
-	Commit        string
-	ProjectsFlag  bool
-	ReleasesFlag  bool
-	SettingsFlag  bool
-	WikiFlag      bool
-	NoBrowserFlag bool
+	Branch          string
+	Commit          string
+	ProjectsFlag    bool
+	ReleasesFlag    bool
+	SettingsFlag    bool
+	WikiFlag        bool
+	NoBrowserFlag   bool
+	HasRepoOverride bool
 }
 
 func NewCmdBrowse(f *cmdutil.Factory, runF func(*BrowseOptions) error) *cobra.Command {
@@ -129,8 +131,9 @@ func NewCmdBrowse(f *cmdutil.Factory, runF func(*BrowseOptions) error) *cobra.Co
 				return cmdutil.FlagErrorf("%q is an invalid argument when using `--branch` or `--commit`", opts.SelectorArg)
 			}
 
-			if cmd.Flags().Changed("repo") {
+			if cmd.Flags().Changed("repo") || os.Getenv("GH_REPO") != "" {
 				opts.GitClient = &remoteGitClient{opts.BaseRepo, opts.HttpClient}
+				opts.HasRepoOverride = true
 			}
 
 			if runF != nil {
@@ -163,14 +166,12 @@ func runBrowse(opts *BrowseOptions) error {
 		return fmt.Errorf("unable to determine base repository: %w", err)
 	}
 
-	if opts.Commit != "" {
-		if opts.Commit == emptyCommitFlag {
-			commit, err := opts.GitClient.LastCommit()
-			if err != nil {
-				return err
-			}
-			opts.Commit = commit.Sha
+	if opts.Commit != "" && opts.Commit == emptyCommitFlag {
+		commit, err := opts.GitClient.LastCommit()
+		if err != nil {
+			return err
 		}
+		opts.Commit = commit.Sha
 	}
 
 	section, err := parseSection(baseRepo, opts)
@@ -180,7 +181,19 @@ func runBrowse(opts *BrowseOptions) error {
 	url := ghrepo.GenerateRepoURL(baseRepo, "%s", section)
 
 	if opts.NoBrowserFlag {
-		_, err := fmt.Fprintln(opts.IO.Out, url)
+		client, err := opts.HttpClient()
+		if err != nil {
+			return err
+		}
+
+		exist, err := api.RepoExists(api.NewClientFromHTTP(client), baseRepo)
+		if err != nil {
+			return err
+		}
+		if !exist {
+			return fmt.Errorf("%s doesn't exist", text.DisplayURL(url))
+		}
+		_, err = fmt.Fprintln(opts.IO.Out, url)
 		return err
 	}
 
@@ -265,7 +278,7 @@ func parseFile(opts BrowseOptions, f string) (p string, start int, end int, err 
 	}
 
 	p = filepath.ToSlash(parts[0])
-	if !path.IsAbs(p) {
+	if !path.IsAbs(p) && !opts.HasRepoOverride {
 		p = path.Join(opts.PathFromRepoRoot(), p)
 		if p == "." || strings.HasPrefix(p, "..") {
 			p = ""

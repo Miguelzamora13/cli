@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cli/go-gh/pkg/text"
+	"github.com/cli/go-gh/v2/pkg/text"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
 )
@@ -71,4 +71,13 @@ func DisplayURL(urlStr string) string {
 		return urlStr
 	}
 	return u.Hostname() + u.Path
+}
+
+// RemoveDiacritics returns the input value without "diacritics", or accent marks
+func RemoveDiacritics(value string) string {
+	return text.RemoveDiacritics(value)
+}
+
+func PadRight(maxWidth int, s string) string {
+	return text.PadRight(maxWidth, s)
 }

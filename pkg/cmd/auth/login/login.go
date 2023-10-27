@@ -14,7 +14,7 @@ import (
 	"github.com/cli/cli/v2/pkg/cmd/auth/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	ghAuth "github.com/cli/go-gh/pkg/auth"
+	ghAuth "github.com/cli/go-gh/v2/pkg/auth"
 	"github.com/spf13/cobra"
 )
 
@@ -58,7 +58,9 @@ func NewCmdLogin(f *cmdutil.Factory, runF func(*LoginOptions) error) *cobra.Comm
 			Authenticate with a GitHub host.
 
 			The default authentication mode is a web-based browser flow. After completion, an
-			authentication token will be stored internally.
+			authentication token will be stored securely in the system credential store.
+			If a credential store is not found or there is an issue using it gh will fallback to writing the token to a plain text file.
+			See %[1]sgh auth status%[1]s for its stored location.
 
 			Alternatively, use %[1]s--with-token%[1]s to pass in a token on standard input.
 			The minimum required scopes for the token are: "repo", "read:org".
@@ -151,6 +153,11 @@ func loginRun(opts *LoginOptions) error {
 		}
 	}
 
+	// The go-gh Config object currently does not support case-insensitive lookups for host names,
+	// so normalize the host name case here before performing any lookups with it or persisting it.
+	// https://github.com/cli/go-gh/pull/105
+	hostname = strings.ToLower(hostname)
+
 	if src, writeable := shared.AuthTokenWriteable(authCfg, hostname); !writeable {
 		fmt.Fprintf(opts.IO.ErrOut, "The value of the %s environment variable is being used for authentication.\n", src)
 		fmt.Fprint(opts.IO.ErrOut, "To have GitHub CLI store credentials instead, first clear the value from the environment.\n")
@@ -167,7 +174,8 @@ func loginRun(opts *LoginOptions) error {
 			return fmt.Errorf("error validating token: %w", err)
 		}
 		// Adding a user key ensures that a nonempty host section gets written to the config file.
-		return authCfg.Login(hostname, "x-access-token", opts.Token, opts.GitProtocol, !opts.InsecureStorage)
+		_, loginErr := authCfg.Login(hostname, "x-access-token", opts.Token, opts.GitProtocol, !opts.InsecureStorage)
+		return loginErr
 	}
 
 	existingToken, _ := authCfg.Token(hostname)

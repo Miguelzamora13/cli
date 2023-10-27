@@ -11,13 +11,17 @@ import (
 	"github.com/cli/cli/v2/internal/codespaces"
 	"github.com/cli/cli/v2/internal/codespaces/api"
 	"github.com/cli/cli/v2/internal/ghrepo"
-	"github.com/cli/cli/v2/internal/text"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/spf13/cobra"
 )
 
 const (
 	DEVCONTAINER_PROMPT_DEFAULT = "Default Codespaces configuration"
+)
+
+const (
+	permissionsPollingInterval = 5 * time.Second
+	permissionsPollingTimeout  = 1 * time.Minute
 )
 
 var (
@@ -69,6 +73,7 @@ type createOptions struct {
 	idleTimeout       time.Duration
 	retentionPeriod   NullableDuration
 	displayName       string
+	useWeb            bool
 }
 
 func newCreateCmd(app *App) *cobra.Command {
@@ -78,10 +83,19 @@ func newCreateCmd(app *App) *cobra.Command {
 		Use:   "create",
 		Short: "Create a codespace",
 		Args:  noArgsConstraint,
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			return cmdutil.MutuallyExclusive(
+				"using --web with --display-name, --idle-timeout, or --retention-period is not supported",
+				opts.useWeb,
+				opts.displayName != "" || opts.idleTimeout != 0 || opts.retentionPeriod.Duration != nil,
+			)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return app.Create(cmd.Context(), opts)
 		},
 	}
+
+	createCmd.Flags().BoolVarP(&opts.useWeb, "web", "w", false, "create codespace from browser, cannot be used with --display-name, --idle-timeout, or --retention-period")
 
 	createCmd.Flags().StringVarP(&opts.repo, "repo", "R", "", "repository name with owner: user/repo")
 	if err := addDeprecatedRepoShorthand(createCmd, &opts.repo); err != nil {
@@ -118,7 +132,11 @@ func (a *App) Create(ctx context.Context, opts createOptions) error {
 		Location:   opts.location,
 	}
 
-	promptForRepoAndBranch := userInputs.Repository == ""
+	if opts.useWeb && userInputs.Repository == "" {
+		return a.browser.Browse(fmt.Sprintf("%s/codespaces/new", a.apiClient.ServerURL()))
+	}
+
+	promptForRepoAndBranch := userInputs.Repository == "" && !opts.useWeb
 	if promptForRepoAndBranch {
 		var defaultRepo string
 		if remotes, _ := a.remotes(); remotes != nil {
@@ -249,12 +267,19 @@ func (a *App) Create(ctx context.Context, opts createOptions) error {
 		}
 	}
 
-	machine, err := getMachineName(ctx, a.apiClient, repository.ID, opts.machine, branch, userInputs.Location, devContainerPath)
-	if err != nil {
-		return fmt.Errorf("error getting machine type: %w", err)
-	}
-	if machine == "" {
-		return errors.New("there are no available machine types for this repository")
+	machine := opts.machine
+	// skip this if we have useWeb and no machine name provided,
+	// because web UI will select default machine type if none is provided
+	// web UI also provide a way to select machine type
+	// therefore we let the user choose from the web UI instead of prompting from CLI
+	if !(opts.useWeb && opts.machine == "") {
+		machine, err = getMachineName(ctx, a.apiClient, repository.ID, opts.machine, branch, userInputs.Location, devContainerPath)
+		if err != nil {
+			return fmt.Errorf("error getting machine type: %w", err)
+		}
+		if machine == "" {
+			return errors.New("there are no available machine types for this repository")
+		}
 	}
 
 	createParams := &api.CreateCodespaceParams{
@@ -271,6 +296,10 @@ func (a *App) Create(ctx context.Context, opts createOptions) error {
 		DisplayName:            opts.displayName,
 	}
 
+	if opts.useWeb {
+		return a.browser.Browse(fmt.Sprintf("%s/codespaces/new?repo=%d&ref=%s&machine=%s&location=%s", a.apiClient.ServerURL(), createParams.RepositoryID, createParams.Branch, createParams.Machine, createParams.Location))
+	}
+
 	var codespace *api.Codespace
 	err = a.RunWithProgress("Creating codespace", func() (err error) {
 		codespace, err = a.apiClient.CreateCodespace(ctx, createParams)
@@ -283,7 +312,7 @@ func (a *App) Create(ctx context.Context, opts createOptions) error {
 			return fmt.Errorf("error creating codespace: %w", err)
 		}
 
-		codespace, err = a.handleAdditionalPermissions(ctx, createParams, aerr.AllowPermissionsURL)
+		codespace, err = a.handleAdditionalPermissions(ctx, createParams, aerr.AllowPermissionsURL, userInputs.Location)
 		if err != nil {
 			// this error could be a cmdutil.SilentError (in the case that the user opened the browser) so we don't want to wrap it
 			return err
@@ -307,17 +336,16 @@ func (a *App) Create(ctx context.Context, opts createOptions) error {
 	return nil
 }
 
-func (a *App) handleAdditionalPermissions(ctx context.Context, createParams *api.CreateCodespaceParams, allowPermissionsURL string) (*api.Codespace, error) {
+func (a *App) handleAdditionalPermissions(ctx context.Context, createParams *api.CreateCodespaceParams, allowPermissionsURL string, location string) (*api.Codespace, error) {
 	var (
 		isInteractive = a.io.CanPrompt()
 		cs            = a.io.ColorScheme()
-		displayURL    = text.DisplayURL(allowPermissionsURL)
 	)
 
 	fmt.Fprintf(a.io.ErrOut, "You must authorize or deny additional permissions requested by this codespace before continuing.\n")
 
 	if !isInteractive {
-		fmt.Fprintf(a.io.ErrOut, "%s in your browser to review and authorize additional permissions: %s\n", cs.Bold("Open this URL"), displayURL)
+		fmt.Fprintf(a.io.ErrOut, "%s in your browser to review and authorize additional permissions: %s\n", cs.Bold("Open this URL"), allowPermissionsURL)
 		fmt.Fprintf(a.io.ErrOut, "Alternatively, you can run %q with the %q option to continue without authorizing additional permissions.\n", a.io.ColorScheme().Bold("create"), cs.Bold("--default-permissions"))
 		return nil, cmdutil.SilentError
 	}
@@ -349,13 +377,44 @@ func (a *App) handleAdditionalPermissions(ctx context.Context, createParams *api
 
 	// if the user chose to continue in the browser, open the URL
 	if answers.Accept == choices[0] {
-		fmt.Fprintln(a.io.ErrOut, "Please re-run the create request after accepting permissions in the browser.")
 		if err := a.browser.Browse(allowPermissionsURL); err != nil {
 			return nil, fmt.Errorf("error opening browser: %w", err)
 		}
-		// browser opened successfully but we do not know if they accepted the permissions
-		// so we must exit and wait for the user to attempt the create again
-		return nil, cmdutil.SilentError
+	}
+
+	// Poll until the user has accepted the permissions or timeout
+	err := a.RunWithProgress("Waiting for permissions to be accepted in the browser", func() (err error) {
+		ctx, cancel := context.WithTimeout(ctx, permissionsPollingTimeout)
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() {
+			for {
+				accepted, err := a.apiClient.GetCodespacesPermissionsCheck(ctx, createParams.RepositoryID, createParams.Branch, location, createParams.DevContainerPath)
+				if err != nil {
+					done <- err
+					return
+				}
+
+				if accepted {
+					done <- nil
+					return
+				}
+
+				// Wait before polling again
+				time.Sleep(permissionsPollingInterval)
+			}
+		}()
+
+		select {
+		case err := <-done:
+			return err
+		case <-ctx.Done():
+			return fmt.Errorf("timed out waiting for permissions to be accepted in the browser")
+		}
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error polling for permissions: %w", err)
 	}
 
 	// if the user chose to create the codespace without the permissions,
@@ -363,7 +422,7 @@ func (a *App) handleAdditionalPermissions(ctx context.Context, createParams *api
 	createParams.PermissionsOptOut = true
 
 	var codespace *api.Codespace
-	err := a.RunWithProgress("Creating codespace", func() (err error) {
+	err = a.RunWithProgress("Creating codespace", func() (err error) {
 		codespace, err = a.apiClient.CreateCodespace(ctx, createParams)
 		return
 	})

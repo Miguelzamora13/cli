@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,13 +24,18 @@ import (
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
 	"github.com/cli/cli/v2/pkg/jsoncolor"
-	"github.com/cli/go-gh/pkg/jq"
-	"github.com/cli/go-gh/pkg/template"
+	"github.com/cli/go-gh/v2/pkg/jq"
+	"github.com/cli/go-gh/v2/pkg/template"
 	"github.com/spf13/cobra"
 )
 
 type ApiOptions struct {
-	IO *iostreams.IOStreams
+	AppVersion string
+	BaseRepo   func() (ghrepo.Interface, error)
+	Branch     func() (string, error)
+	Config     func() (config.Config, error)
+	HttpClient func() (*http.Client, error)
+	IO         *iostreams.IOStreams
 
 	Hostname            string
 	RequestMethod       string
@@ -46,20 +52,16 @@ type ApiOptions struct {
 	Template            string
 	CacheTTL            time.Duration
 	FilterOutput        string
-
-	Config     func() (config.Config, error)
-	HttpClient func() (*http.Client, error)
-	BaseRepo   func() (ghrepo.Interface, error)
-	Branch     func() (string, error)
+	Verbose             bool
 }
 
 func NewCmdApi(f *cmdutil.Factory, runF func(*ApiOptions) error) *cobra.Command {
 	opts := ApiOptions{
-		IO:         f.IOStreams,
-		Config:     f.Config,
-		HttpClient: f.HttpClient,
+		AppVersion: f.AppVersion,
 		BaseRepo:   f.BaseRepo,
 		Branch:     f.Branch,
+		Config:     f.Config,
+		IO:         f.IOStreams,
 	}
 
 	cmd := &cobra.Command{
@@ -208,7 +210,8 @@ func NewCmdApi(f *cmdutil.Factory, runF func(*ApiOptions) error) *cobra.Command 
 			}
 
 			if err := cmdutil.MutuallyExclusive(
-				"only one of `--template`, `--jq`, or `--silent` may be used",
+				"only one of `--template`, `--jq`, `--silent`, or `--verbose` may be used",
+				opts.Verbose,
 				opts.Silent,
 				opts.FilterOutput != "",
 				opts.Template != "",
@@ -236,6 +239,7 @@ func NewCmdApi(f *cmdutil.Factory, runF func(*ApiOptions) error) *cobra.Command 
 	cmd.Flags().StringVarP(&opts.Template, "template", "t", "", "Format JSON output using a Go template; see \"gh help formatting\"")
 	cmd.Flags().StringVarP(&opts.FilterOutput, "jq", "q", "", "Query to select values from the response using jq syntax")
 	cmd.Flags().DurationVar(&opts.CacheTTL, "cache", 0, "Cache the response, e.g. \"3600s\", \"60m\", \"1h\"")
+	cmd.Flags().BoolVar(&opts.Verbose, "verbose", false, "Include full HTTP request and response in the output")
 	return cmd
 }
 
@@ -282,12 +286,33 @@ func apiRun(opts *ApiOptions) error {
 		requestHeaders = append(requestHeaders, "Accept: "+previewNamesToMIMETypes(opts.Previews))
 	}
 
-	httpClient, err := opts.HttpClient()
+	cfg, err := opts.Config()
 	if err != nil {
 		return err
 	}
-	if opts.CacheTTL > 0 {
-		httpClient = api.NewCachedHTTPClient(httpClient, opts.CacheTTL)
+
+	if opts.HttpClient == nil {
+		opts.HttpClient = func() (*http.Client, error) {
+			log := opts.IO.ErrOut
+			if opts.Verbose {
+				log = opts.IO.Out
+			}
+			opts := api.HTTPClientOptions{
+				AppVersion:        opts.AppVersion,
+				CacheTTL:          opts.CacheTTL,
+				Config:            cfg.Authentication(),
+				EnableCache:       opts.CacheTTL > 0,
+				Log:               log,
+				LogColorize:       opts.IO.ColorEnabled(),
+				LogVerboseHTTP:    opts.Verbose,
+				SkipAcceptHeaders: true,
+			}
+			return api.NewHTTPClient(opts)
+		}
+	}
+	httpClient, err := opts.HttpClient()
+	if err != nil {
+		return err
 	}
 
 	if !opts.Silent {
@@ -303,10 +328,10 @@ func apiRun(opts *ApiOptions) error {
 	if opts.Silent {
 		bodyWriter = io.Discard
 	}
-
-	cfg, err := opts.Config()
-	if err != nil {
-		return err
+	if opts.Verbose {
+		// httpClient handles output when verbose flag is specified.
+		bodyWriter = io.Discard
+		headersWriter = io.Discard
 	}
 
 	host, _ := cfg.Authentication().DefaultHost()
@@ -321,6 +346,7 @@ func apiRun(opts *ApiOptions) error {
 		return err
 	}
 
+	isFirstPage := true
 	hasNextPage := true
 	for hasNextPage {
 		resp, err := httpRequest(httpClient, host, method, requestPath, requestBody, requestHeaders)
@@ -328,10 +354,16 @@ func apiRun(opts *ApiOptions) error {
 			return err
 		}
 
-		endCursor, err := processResponse(resp, opts, bodyWriter, headersWriter, &tmpl)
+		if !isGraphQL {
+			requestPath, hasNextPage = findNextPage(resp)
+			requestBody = nil // prevent repeating GET parameters
+		}
+
+		endCursor, err := processResponse(resp, opts, bodyWriter, headersWriter, tmpl, isFirstPage, !hasNextPage)
 		if err != nil {
 			return err
 		}
+		isFirstPage = false
 
 		if !opts.Paginate {
 			break
@@ -342,9 +374,6 @@ func apiRun(opts *ApiOptions) error {
 			if hasNextPage {
 				params["endCursor"] = endCursor
 			}
-		} else {
-			requestPath, hasNextPage = findNextPage(resp)
-			requestBody = nil // prevent repeating GET parameters
 		}
 
 		if hasNextPage && opts.ShowResponseHeaders {
@@ -355,7 +384,7 @@ func apiRun(opts *ApiOptions) error {
 	return tmpl.Flush()
 }
 
-func processResponse(resp *http.Response, opts *ApiOptions, bodyWriter, headersWriter io.Writer, template *template.Template) (endCursor string, err error) {
+func processResponse(resp *http.Response, opts *ApiOptions, bodyWriter, headersWriter io.Writer, template *template.Template, isFirstPage, isLastPage bool) (endCursor string, err error) {
 	if opts.ShowResponseHeaders {
 		fmt.Fprintln(headersWriter, resp.Proto, resp.Status)
 		printHeaders(headersWriter, resp.Header, opts.IO.ColorEnabled())
@@ -387,7 +416,11 @@ func processResponse(resp *http.Response, opts *ApiOptions, bodyWriter, headersW
 
 	if opts.FilterOutput != "" && serverError == "" {
 		// TODO: reuse parsed query across pagination invocations
-		err = jq.Evaluate(responseBody, bodyWriter, opts.FilterOutput)
+		indent := ""
+		if opts.IO.IsStdoutTTY() {
+			indent = "  "
+		}
+		err = jq.EvaluateFormatted(responseBody, bodyWriter, opts.FilterOutput, indent, opts.IO.ColorEnabled())
 		if err != nil {
 			return
 		}
@@ -399,6 +432,13 @@ func processResponse(resp *http.Response, opts *ApiOptions, bodyWriter, headersW
 	} else if isJSON && opts.IO.ColorEnabled() {
 		err = jsoncolor.Write(bodyWriter, responseBody, "  ")
 	} else {
+		if isJSON && opts.Paginate && !isGraphQLPaginate && !opts.ShowResponseHeaders {
+			responseBody = &paginatedArrayReader{
+				Reader:      responseBody,
+				isFirstPage: isFirstPage,
+				isLastPage:  isLastPage,
+			}
+		}
 		_, err = io.Copy(bodyWriter, responseBody)
 	}
 	if err != nil {
@@ -454,6 +494,11 @@ func fillPlaceholders(value string, opts *ApiOptions) (string, error) {
 				err = e
 			}
 		case "branch":
+			if os.Getenv("GH_REPO") != "" {
+				err = errors.New("unable to determine an appropriate value for the 'branch' placeholder")
+				return m
+			}
+
 			if branch, e := opts.Branch(); e == nil {
 				return branch
 			} else {
